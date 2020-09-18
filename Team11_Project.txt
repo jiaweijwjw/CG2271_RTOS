@@ -1,0 +1,916 @@
+/*----------------------------------------------------------------------------
+ * CMSIS-RTOS 'main' function template
+ *---------------------------------------------------------------------------*/
+ 
+#include "RTE_Components.h"
+#include  CMSIS_device_header
+#include "cmsis_os2.h"
+#include <stdbool.h>
+
+#define PTB0_Pin 0 // PortB Pin 0
+ 
+#define BAUD_RATE 9600
+#define UART_RX_PORTE23 23
+#define UART2_INT_PRIO  128
+
+#define GREEN_LED0 7 //PortC Pin 7
+#define GREEN_LED1 0
+#define GREEN_LED2 3
+#define GREEN_LED3 4
+#define GREEN_LED4 5
+#define GREEN_LED5 6
+#define GREEN_LED6 10
+#define GREEN_LED7 11
+
+#define RED_LED0 1 //PortA
+
+// Wheels. A is Forward, B is Backward.
+#define FRONT_LEFT_A  13//PortA
+#define FRONT_LEFT_B  5 //PortD
+#define FRONT_RIGHT_A 0 //PortD
+#define FRONT_RIGHT_B 2 //PortD
+#define BACK_LEFT_A   12//PortC
+#define BACK_LEFT_B   13//PortC
+#define BACK_RIGHT_A  16//PortC
+#define BACK_RIGHT_B  17//PortC
+
+#define MASK(x) (1 << (x))
+
+// Commands sent from phone.
+#define FRONT 0x1
+#define LEFT 0x2
+#define RIGHT 0x3
+#define BACK 0x4
+#define FRONT_N_LEFT 0x5
+#define FRONT_N_RIGHT 0x6
+#define BACK_N_LEFT 0x7
+#define BACK_N_RIGHT 0x8
+#define STOP 0x9
+#define END 0b1010
+
+#define MSG_COUNT 1
+
+osSemaphoreId_t startSem;
+osMessageQueueId_t audioMsg, ledRedMsg, ledGreenMsg, motorMsg; // each thread (motor, led, audio) will have their own Msg queue.
+
+typedef struct {
+	uint8_t cmd;
+	uint8_t data;
+} myDataPkt;
+
+// VARIABLE DECLARATIONS
+bool front = false;
+bool left = false;
+bool right = false;
+bool back = false;
+bool reverse = false;
+bool end = false;
+
+volatile uint8_t rx_data = 0x0;
+
+void initGPIO_Motor(void){
+	// Enable Clock to PORTA, PORTC and PORTD 
+	SIM->SCGC5 |= (SIM_SCGC5_PORTC_MASK) | (SIM_SCGC5_PORTA_MASK) | (SIM_SCGC5_PORTD_MASK);
+	// Configure MUX settings to make all 3 pins GPIO
+	//PCR: pin control register
+	
+	PORTA->PCR[FRONT_LEFT_A] &= ~PORT_PCR_MUX_MASK;
+	PORTA->PCR[FRONT_LEFT_A] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTD->PCR[FRONT_LEFT_B] &= ~PORT_PCR_MUX_MASK;
+	PORTD->PCR[FRONT_LEFT_B] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTD->PCR[FRONT_RIGHT_A] &= ~PORT_PCR_MUX_MASK;
+	PORTD->PCR[FRONT_RIGHT_A] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTD->PCR[FRONT_RIGHT_B] &= ~PORT_PCR_MUX_MASK;
+	PORTD->PCR[FRONT_RIGHT_B] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[BACK_LEFT_A] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[BACK_LEFT_A] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[BACK_LEFT_B] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[BACK_LEFT_B] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[BACK_RIGHT_A] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[BACK_RIGHT_A] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[BACK_RIGHT_B] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[BACK_RIGHT_B] |= PORT_PCR_MUX(1); //set it to GPIO
+
+	// Set Data Direction Registers for PORTA, PORTC and PORTD
+	//0...011000000000000000000, set it to output
+	PTC->PDDR |= (MASK(BACK_LEFT_A) | MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_A) | 
+								MASK(BACK_RIGHT_B));
+								
+	PTA->PDDR |= (MASK(FRONT_LEFT_A));
+	PTD->PDDR |= (MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_A) | MASK(FRONT_RIGHT_B));
+}
+
+void initGPIO_LED(void){
+	// Enable Clock to PORTA and PORTC
+	//supply power
+	SIM->SCGC5 |= (SIM_SCGC5_PORTC_MASK) |(SIM_SCGC5_PORTA_MASK);
+	// Configure MUX settings to make all GPIO pins
+	//PCR: pin control register
+	
+	PORTC->PCR[GREEN_LED0] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED0] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED1] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED1] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED2] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED2] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED3] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED3] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED4] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED4] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED5] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED5] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED6] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED6] |= PORT_PCR_MUX(1); //set it to GPIO 
+  PORTC->PCR[GREEN_LED7] &= ~PORT_PCR_MUX_MASK;
+	PORTC->PCR[GREEN_LED7] |= PORT_PCR_MUX(1); //set it to GPIO
+	
+	PORTA->PCR[RED_LED0] &= ~PORT_PCR_MUX_MASK;
+	PORTA->PCR[RED_LED0] |= PORT_PCR_MUX(1); //set it to GPIO 
+	
+	// Set Data Direction Registers for PORTA and PORTC
+	//0...011000000000000000000, set it to output
+	PTC->PDDR |= (MASK(GREEN_LED0) | MASK(GREEN_LED1) | MASK(GREEN_LED2) | 
+								MASK(GREEN_LED3) | MASK(GREEN_LED4) | MASK(GREEN_LED5) | 
+								MASK(GREEN_LED6) | MASK(GREEN_LED7));
+								
+	PTA->PDDR |= MASK(RED_LED0);
+}
+
+void initPWM(void){
+	// Enable Clock to PORTB
+	//supply power
+	SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+	// Configure MUX settings to make all TPM pins
+	//PCR: pin control register
+	PORTB->PCR[PTB0_Pin] &= ~PORT_PCR_MUX_MASK;
+	PORTB->PCR[PTB0_Pin] |= PORT_PCR_MUX(3); //set it to TPM
+	
+	SIM->SCGC6 |= SIM_SCGC6_TPM1_MASK;
+	
+	SIM->SOPT2 &= ~SIM_SOPT2_TPMSRC_MASK;
+	SIM->SOPT2 |= SIM_SOPT2_TPMSRC(1);
+
+	TPM1->MOD = 0;
+	TPM1_C0V = 0;
+	
+	TPM1->SC &= ~((TPM_SC_CMOD_MASK) | (TPM_SC_PS_MASK));
+	TPM1->SC |= (TPM_SC_CMOD(1) | TPM_SC_PS(7));
+	TPM1->SC &= ~(TPM_SC_CPWMS_MASK);
+	
+	TPM1_C0SC &= ~((TPM_CnSC_ELSB_MASK) | (TPM_CnSC_ELSA_MASK) | (TPM_CnSC_MSB_MASK) | (TPM_CnSC_MSA_MASK));
+	TPM1_C0SC |= (TPM_CnSC_ELSB(1) | TPM_CnSC_MSB(1));
+}
+
+void onREDLED(void) {
+	PTA->PSOR |= MASK(RED_LED0);
+}
+
+void offREDLED(void) {
+	PTA->PCOR |= MASK(RED_LED0);
+}
+
+void onGREENLED(void) {
+	PTC->PSOR |= MASK(GREEN_LED0) | MASK(GREEN_LED1) | MASK(GREEN_LED2) | MASK(GREEN_LED3) | 
+	MASK(GREEN_LED4) | MASK(GREEN_LED5) | MASK(GREEN_LED6) | MASK(GREEN_LED7);
+}
+
+void offGREENLED(void) {
+	PTC->PCOR |= MASK(GREEN_LED0) | MASK(GREEN_LED1) | MASK(GREEN_LED2) | MASK(GREEN_LED3) | 
+	MASK(GREEN_LED4) | MASK(GREEN_LED5) | MASK(GREEN_LED6) | MASK(GREEN_LED7);
+}
+
+void initUART2(uint32_t baud_rate) {
+	uint32_t divisor, bus_clock;
+	
+	SIM->SCGC4 |= SIM_SCGC4_UART2_MASK;
+	SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK;
+	
+	PORTE->PCR[UART_RX_PORTE23] &= ~PORT_PCR_MUX_MASK;
+	PORTE->PCR[UART_RX_PORTE23] |=  PORT_PCR_MUX(4); // UART2 RX
+	
+	// Disable TX and RX
+	UART2->C2 &= ~((UART_C2_TE_MASK) | (UART_C2_RE_MASK));
+	//The 13-bit baud rate setting [SBR12:SBR0] should only be updated when the transmitter and receiver are both disabled.
+
+	bus_clock = (DEFAULT_SYSTEM_CLOCK)/2;
+	divisor =  bus_clock / (baud_rate * 16); // UART1 and 2 has a fixed oversampling rate of 16x.
+	UART2->BDH = UART_BDH_SBR(divisor >> 8);
+	UART2->BDL = UART_BDL_SBR(divisor);
+	
+	UART2->C1 = 0;
+	UART2->S2 = 0;
+	UART2->C3 = 0;
+	
+	// Enable RX
+	UART2->C2 |= (UART_C2_RE_MASK);
+	
+	NVIC_SetPriority(UART2_IRQn, 2);
+	NVIC_ClearPendingIRQ(UART2_IRQn);
+	NVIC_EnableIRQ(UART2_IRQn);
+	
+	// Enable interrupts to be triggered when RDRF flags are raised
+	UART2->C2 |= (UART_C2_RIE_MASK);
+}
+
+void UART2_IRQHandler(void) {
+	NVIC_ClearPendingIRQ(UART2_IRQn);
+	// note that both the TDRE and RDRF bits in the S1 register cant be written to.
+	// in C, any value that is not 0 will return true. and 0 will return false.
+	
+		if (UART2->S1 & UART_S1_RDRF_MASK) {
+			// receive
+			rx_data = UART2->D; // doing this clears the RDRF flag.
+			switch(rx_data) {
+				case 0x1: 
+					front = true;
+					break;
+				case 0x2:
+					left = true;
+					break;
+				case 0x3:
+					right = true;
+					break;
+				case 0x4:
+					back = true;
+					break;
+				case 0x5:
+					front = false;
+					break;
+				case 0x6:
+					left = false;
+					break;
+				case 0x7:
+					right = false;
+					break;
+				case 0x8:
+					back = false;
+					break;
+				case 0x9:
+					osSemaphoreRelease(startSem);
+					break;
+				case 0xA:
+					end = true;
+					break;
+			}
+		} 
+		if ((UART2->S1) & (UART_S1_OR_MASK | UART_S1_NF_MASK | UART_S1_FE_MASK | UART_S1_PF_MASK)) {
+			// if there is an error.
+			// as long as one of the error flag is 1, will be true, since non-zero.
+			// queue is empty so disable tx
+			UART2->C2 &= ~UART_C2_TIE_MASK;
+		}
+}
+
+uint8_t checkDirection(void) {
+	if (front && !left && !right && !back) {
+		return FRONT;
+	} else if (!front && left && !right && !back) {
+		return LEFT;
+	} else if (!front && !left && right && !back) {
+		return RIGHT;
+	} else if (!front && !left && !right && back) {
+		return BACK;
+	} else if (front && left && !right && !back) {
+		return FRONT_N_LEFT;
+	} else if (front && !left && right && !back) {
+		return FRONT_N_RIGHT;
+	} else if (!front && left && !right && back) {
+		return  BACK_N_LEFT;
+	} else if (!front && !left && right && back) {
+		return BACK_N_RIGHT;
+	} else if (end) {
+		return END;
+	} else {
+		return STOP;
+	}
+}
+
+void green_led_control(uint8_t led_number, uint8_t state){
+	if (state == 1) {
+    switch(led_number) {
+      case 0: 
+        PTC->PSOR = MASK(GREEN_LED0);
+        break;
+      case 1:
+        PTC->PSOR = MASK(GREEN_LED1);
+        break;
+      case 2:
+        PTC->PSOR = MASK(GREEN_LED2);
+        break;
+      case 3:
+        PTC->PSOR = MASK(GREEN_LED3);
+        break;
+      case 4:
+        PTC->PSOR = MASK(GREEN_LED4);
+        break;
+      case 5:
+        PTC->PSOR = MASK(GREEN_LED5);
+        break;
+      case 6:
+        PTC->PSOR = MASK(GREEN_LED6);
+        break;
+      case 7:
+        PTC->PSOR = MASK(GREEN_LED7);
+        break;
+    }
+	} else {
+		switch(led_number) {
+      case 0: 
+        PTC->PCOR = MASK(GREEN_LED0);
+        break;
+      case 1:
+        PTC->PCOR = MASK(GREEN_LED1);
+        break;
+      case 2:
+        PTC->PCOR = MASK(GREEN_LED2);
+        break;
+      case 3:
+        PTC->PCOR = MASK(GREEN_LED3);
+        break;
+      case 4:
+        PTC->PCOR = MASK(GREEN_LED4);
+        break;
+      case 5:
+        PTC->PCOR = MASK(GREEN_LED5);
+        break;
+      case 6:
+        PTC->PCOR = MASK(GREEN_LED6);
+        break;
+      case 7:
+        PTC->PCOR = MASK(GREEN_LED7);
+        break;
+    }
+	}
+}
+
+/*----------------------------------------------------------------------------
+ * Application main thread
+ *---------------------------------------------------------------------------*/
+
+void tBrain (void *argument) {
+	
+	osSemaphoreAcquire(startSem, osWaitForever);
+	
+	uint8_t command;
+
+	myDataPkt myData;
+	myData.cmd = 0x3;
+	myData.data = 0x0;
+	
+	osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+	osMessageQueuePut(audioMsg, &myData, NULL, 0);
+	osDelay(2000);//this is to offset the 2 rounds of blinking of the green led when the bot starts
+	
+  for (;;) {
+		myData.cmd = 0x0;
+
+		command = checkDirection();
+		switch (command){
+			case FRONT:
+				myData.cmd =  0x1;
+				myData.data = 0x1;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case LEFT:
+				myData.cmd =  0x1;
+				myData.data = 0x2;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case RIGHT:
+				myData.cmd =  0x1;
+				myData.data = 0x3;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case BACK:
+				myData.cmd =  0x1;
+				myData.data = 0x4;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case FRONT_N_LEFT:
+				myData.cmd =  0x1;
+				myData.data = 0x5;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case FRONT_N_RIGHT:
+				myData.cmd =  0x1;
+				myData.data = 0x6;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case BACK_N_LEFT:
+				myData.cmd =  0x1;
+				myData.data = 0x7;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case BACK_N_RIGHT:
+				myData.cmd =  0x1;
+				myData.data = 0x8;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case STOP:
+				myData.cmd =  0x2;
+				myData.data = 0x9;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledGreenMsg, &myData, NULL, 0);
+				osMessageQueuePut(ledRedMsg, &myData, NULL, 0);
+				osMessageQueuePut(motorMsg, &myData, NULL, 0);
+				break;
+			case END:
+				myData.cmd =  0x4;
+				myData.data = 0xA;
+				osMessageQueuePut(audioMsg, &myData, NULL, 0);
+				break;
+		}
+	}
+}
+
+void tAudio (void *argument) {
+	//The clock is running at 48MHz then being prescaler by 128 times, hence
+  //the frequency will be 48,000,000 / 128 = 375,000 Hz.
+	// 375,000/(1 + MOD) = frequency (Eg:262Hz)
+	//C_262Hz: 1430 : MOD = (375,000 / 262) - 1 = 1430
+	
+	//main tune: memories
+  int G = 955;
+  int FSharp = 1014;
+  int F = 1073;
+  int E = 1136;
+  int DSharp = 1206;
+  int D = 1274;
+  int CSharp = 1354;
+  int C = 1430;
+  int B = 1518;
+  int ASharp = 1609;
+  int GSharp = 1803;
+  int base_time = 250;
+	
+	//window start up
+	int DFlatS = 300;
+	int DFlatF = 602;
+	int AFlat = 401;
+	int GFlatF = 450;
+	int F_One = 8522;
+	int GFlatO = 7211;
+	
+	//birthday song
+	//c,c,d,c,f,e
+	//c,c,d,c,g,f
+	//c,c,c,a,f,e,d
+	//b#,b#,a,f,g,f
+
+	int C_Five = 716;
+	int BFlat = 803;
+	int A = 851;
+  
+	myDataPkt myRxData;
+	myRxData.cmd = 0x0;
+	myRxData.data = 0x0;
+	
+  for (;;) {
+		osMessageQueueGet(audioMsg, &myRxData, NULL, osWaitForever);
+		
+		if(myRxData.cmd == 0x3) {//window start up tune 
+			TPM1->MOD = DFlatS;   
+			TPM1_C0V = DFlatS/2;
+			TPM1->MOD = F_One;   
+			TPM1_C0V = F_One/2;
+		osDelay(base_time);
+			TPM1->MOD = DFlatF;   
+			TPM1_C0V = DFlatF/2;
+			TPM1->MOD = F_One;   
+			TPM1_C0V = F_One/2;
+		osDelay(base_time);
+			TPM1->MOD = AFlat; 
+			TPM1_C0V = AFlat/2;
+			TPM1->MOD = F_One;   
+			TPM1_C0V = F_One/2;
+		osDelay(base_time);
+			TPM1->MOD = GFlatF;
+			TPM1_C0V = GFlatF/2;
+			TPM1->MOD = GFlatO;   
+			TPM1_C0V = GFlatO/2;
+		osDelay(base_time*1.5);
+			TPM1->MOD = DFlatS;
+			TPM1_C0V = DFlatS/2;
+			TPM1->MOD = GFlatO;   
+			TPM1_C0V = GFlatO/2;
+		osDelay(base_time);
+			TPM1->MOD = AFlat;
+			TPM1_C0V = AFlat/2;
+		osDelay(base_time*2.5);
+		
+		} else if (myRxData.cmd == 0x1 || myRxData.cmd == 0x2){//main tune: memories
+				TPM1->MOD = FSharp;   
+				TPM1_C0V = FSharp/2;
+			osDelay(base_time*2);
+				TPM1->MOD = DSharp;   
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = E; 
+				TPM1_C0V = E/2;
+			osDelay(base_time);
+				TPM1->MOD = FSharp;
+				TPM1_C0V = FSharp/2;
+			osDelay(base_time*2);
+				TPM1->MOD = DSharp;
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = E;
+				TPM1_C0V = E/2;
+			osDelay(base_time);
+				TPM1->MOD = FSharp;
+				TPM1_C0V = FSharp/2;
+			osDelay(base_time*3);
+			
+				TPM1->MOD = DSharp;
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time*2);
+				TPM1->MOD = B;
+				TPM1_C0V = B/2;
+			osDelay(base_time);
+				TPM1->MOD = CSharp; 
+				TPM1_C0V = CSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = DSharp;
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time*2);
+				TPM1->MOD = B;  
+				TPM1_C0V = B/2;
+			osDelay(base_time);
+				TPM1->MOD = CSharp;    
+				TPM1_C0V = CSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = DSharp;
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time*2);
+				TPM1->MOD = B;  
+				TPM1_C0V = B/2;
+			osDelay(base_time);
+				TPM1->MOD = CSharp;    
+				TPM1_C0V = CSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = DSharp;
+				TPM1_C0V = DSharp/2;
+			osDelay(base_time*2);
+			
+				TPM1->MOD = CSharp;    
+				TPM1_C0V = CSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = B;  
+				TPM1_C0V = B/2;
+			osDelay(base_time);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*1.7);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*1.7);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*1.7);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = FSharp*2;  
+				TPM1_C0V = FSharp;
+			osDelay(base_time);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time);
+				TPM1->MOD = FSharp*2;  
+				TPM1_C0V = FSharp;
+			osDelay(base_time*0.7);
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = FSharp*2;  
+				TPM1_C0V = FSharp;
+			osDelay(base_time*3);
+			
+				TPM1->MOD = FSharp*2;  
+				TPM1_C0V = FSharp;
+			osDelay(base_time*2);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*0.7);
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*0.7);
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*1.7);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = GSharp/2;
+			osDelay(base_time*1.7);
+				TPM1->MOD = GSharp;  
+				TPM1_C0V = 0;
+			osDelay(base_time*0.3);
+				TPM1->MOD = B;  
+				TPM1_C0V = B/2;
+			osDelay(base_time*2);
+				TPM1->MOD = ASharp;  
+				TPM1_C0V = ASharp/2;
+			osDelay(base_time*3);
+			
+		} else if(myRxData.cmd == 0x4) {//birthday song
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = D; 
+				TPM1_C0V = D/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C;
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = F;
+				TPM1_C0V = F/2;
+			osDelay(base_time*2);
+				TPM1->MOD = E;
+				TPM1_C0V = E/2;
+			osDelay(base_time*2);
+			
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = D; 
+				TPM1_C0V = D/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C;
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = G;
+				TPM1_C0V = G/2;
+			osDelay(base_time*2);
+				TPM1->MOD = F;
+				TPM1_C0V = F/2;
+			osDelay(base_time*2);
+			
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C;   
+				TPM1_C0V = C/2;
+			osDelay(base_time*2);
+				TPM1->MOD = C_Five;
+				TPM1_C0V = C_Five/2;
+			osDelay(base_time*2);
+				TPM1->MOD = A; 
+				TPM1_C0V = A/2;
+			osDelay(base_time*2);
+				TPM1->MOD = F;
+				TPM1_C0V = F/2;
+			osDelay(base_time*2);
+				TPM1->MOD = E;
+				TPM1_C0V = E/2;
+			osDelay(base_time*2);
+				TPM1->MOD = D;
+				TPM1_C0V = D/2;
+			osDelay(base_time*2);
+
+				TPM1->MOD = BFlat;   
+				TPM1_C0V = BFlat/2;
+			osDelay(base_time*2);
+				TPM1->MOD = BFlat;
+				TPM1_C0V = BFlat/2;
+			osDelay(base_time*2);
+				TPM1->MOD = A; 
+				TPM1_C0V = A/2;
+			osDelay(base_time*2);
+				TPM1->MOD = F;
+				TPM1_C0V = F/2;
+			osDelay(base_time*2);
+				TPM1->MOD = G;
+				TPM1_C0V = G/2;
+			osDelay(base_time*2);
+				TPM1->MOD = F;
+				TPM1_C0V = F/2;
+			osDelay(base_time*2);	
+		}
+  }
+}
+
+void tGreenLED (void *argument) {
+	
+	unsigned char led_number = 0x0;
+	
+	myDataPkt myRxData;
+	myRxData.cmd = 0x0;
+	myRxData.data = 0x0;
+	
+	for (;;) {
+		osMessageQueueGet(ledGreenMsg, &myRxData, NULL, osWaitForever);
+		if (myRxData.cmd == 0x1) { // MOVING
+				offGREENLED();
+				switch(led_number) {
+				case 0: 
+					PTC->PSOR |= MASK(GREEN_LED0);
+					PTC->PCOR |= MASK(GREEN_LED7);
+					break;
+				case 1:
+					PTC->PSOR |= MASK(GREEN_LED1);
+					PTC->PCOR |= MASK(GREEN_LED0);
+					break;
+				case 2:
+					PTC->PSOR |= MASK(GREEN_LED2);
+					PTC->PCOR |= MASK(GREEN_LED1);
+					break;
+				case 3:
+					PTC->PSOR |= MASK(GREEN_LED3);
+					PTC->PCOR |= MASK(GREEN_LED2);
+					break;
+				case 4:
+					PTC->PSOR |= MASK(GREEN_LED4);
+					PTC->PCOR |= MASK(GREEN_LED3);
+					break;
+				case 5:
+					PTC->PSOR |= MASK(GREEN_LED5);
+					PTC->PCOR |= MASK(GREEN_LED4);
+					break;
+				case 6:
+					PTC->PSOR |= MASK(GREEN_LED6);
+					PTC->PCOR |= MASK(GREEN_LED5);
+					break;
+				case 7:
+					PTC->PSOR |= MASK(GREEN_LED7);
+					PTC->PCOR |= MASK(GREEN_LED6);
+					break;
+				}
+				if (reverse) {
+					--led_number;
+					if (led_number == 0) {
+						reverse = false;
+					}
+				} else {
+					++led_number;
+					if (led_number == 0x7) {
+						reverse = true;
+					}
+				}
+				osDelay(250);
+		} else if (myRxData.cmd == 0x2) { // STATIONARY
+				onGREENLED();
+		} else if (myRxData.cmd == 0x3) {
+			for (int i = 0; i < 2; i++) {
+				onGREENLED();
+				osDelay(500);
+				offGREENLED();
+				osDelay(500);
+			}
+		}
+	}
+}
+
+void tRedLED (void *argument) {
+	
+	myDataPkt myRxData;
+	myRxData.cmd = 0x0;
+	myRxData.data = 0x0;
+	
+	for (;;) {
+		osMessageQueueGet(ledRedMsg, &myRxData, NULL, osWaitForever);
+		if (myRxData.cmd == 0x01) { // MOVING
+			onREDLED();
+			osDelay(500);
+			offREDLED();
+			osDelay(500);
+		}
+	  if (myRxData.cmd == 0x02) { // STATIONARY
+			onREDLED();
+			osDelay(250);
+			offREDLED();
+			osDelay(250);
+		}
+	}
+}
+ 
+void tMotorControl (void *argument) {
+	
+	myDataPkt myRxData;
+	myRxData.cmd = 0x0;
+	myRxData.data = 0x0;
+	// all FRONTs are D except FRONT_LEFT_A
+   for(;;) {
+			osMessageQueueGet(motorMsg, &myRxData, NULL, osWaitForever);
+			if (myRxData.cmd == 0x1 && myRxData.data == 0x1) {
+				PTA->PSOR |= MASK(FRONT_LEFT_A);
+				PTD->PSOR |= MASK(FRONT_RIGHT_A);
+				PTC->PSOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_A);
+				PTC->PCOR |= MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_B);
+				PTD->PCOR |= MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_B); 
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x2) {
+				PTD->PSOR |= MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_A);
+				PTC->PSOR |= MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_A);
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_B);
+				PTD->PCOR |= MASK(FRONT_RIGHT_B);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x3) {
+				PTA->PSOR |= MASK(FRONT_LEFT_A);
+				PTD->PSOR |= MASK(FRONT_RIGHT_B);
+				PTC->PSOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_B);
+				PTD->PCOR |= MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_A);
+				PTC->PCOR |= MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_A);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x4) {
+				PTD->PSOR |= MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_B);
+				PTC->PSOR |= MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_B);
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_RIGHT_A);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_A);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x5) {
+				PTD->PSOR |= MASK(FRONT_RIGHT_A);
+				PTC->PSOR |= MASK(BACK_RIGHT_A);
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_RIGHT_B) | MASK(FRONT_LEFT_B);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_B) | MASK(BACK_LEFT_B);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x6) {
+				PTA->PSOR |= MASK(FRONT_LEFT_A);
+				PTC->PSOR |= MASK(BACK_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_LEFT_B) | MASK(FRONT_RIGHT_A) | MASK(FRONT_RIGHT_B);
+				PTC->PCOR |= MASK(BACK_LEFT_B) | MASK(BACK_RIGHT_A) | MASK(BACK_RIGHT_B);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x7)  {
+				PTD->PSOR |= MASK(FRONT_RIGHT_B);
+				PTC->PSOR |= MASK(BACK_RIGHT_B);
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_RIGHT_A) | MASK(FRONT_LEFT_B);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_A) | MASK(BACK_LEFT_B);
+			} else if (myRxData.cmd == 0x1 && myRxData.data == 0x8) {
+				PTD->PSOR |= MASK(FRONT_LEFT_B);
+				PTC->PSOR |= MASK(BACK_LEFT_B);
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_RIGHT_A) | MASK(FRONT_RIGHT_B);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_A) | MASK(BACK_RIGHT_B);
+			} else if (myRxData.cmd == 0x2 && myRxData.data == 0x9) {
+				PTA->PCOR |= MASK(FRONT_LEFT_A);
+				PTD->PCOR |= MASK(FRONT_RIGHT_A) | MASK(FRONT_RIGHT_B) | MASK(FRONT_LEFT_B);
+				PTC->PCOR |= MASK(BACK_LEFT_A) | MASK(BACK_RIGHT_A) | MASK(BACK_RIGHT_B) | MASK(BACK_LEFT_B);
+			}
+   }   
+}
+
+int main (void) {
+ 
+  // System Initialization
+  SystemCoreClockUpdate();
+	initGPIO_LED();
+	initUART2(BAUD_RATE);
+	initGPIO_Motor();
+	initPWM();
+ 
+  osKernelInitialize();                 // Initialize CMSIS-RTOS  
+	startSem = osSemaphoreNew(1, 0, NULL);
+	osThreadNew(tBrain, NULL, NULL);
+	osThreadNew(tAudio, NULL, NULL);
+	osThreadNew(tGreenLED, NULL, NULL);
+	osThreadNew(tRedLED, NULL, NULL);
+	osThreadNew(tMotorControl, NULL, NULL);
+	audioMsg = osMessageQueueNew(MSG_COUNT, sizeof(myDataPkt), NULL);
+	ledRedMsg = osMessageQueueNew(MSG_COUNT, sizeof(myDataPkt), NULL);
+	ledGreenMsg = osMessageQueueNew(MSG_COUNT, sizeof(myDataPkt), NULL);
+	motorMsg = osMessageQueueNew(MSG_COUNT, sizeof(myDataPkt), NULL);
+  osKernelStart();                      // Start thread execution
+  for (;;) {}
+}
